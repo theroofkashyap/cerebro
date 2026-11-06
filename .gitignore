@@ -1,0 +1,5 @@
+build/
+.DS_Store
+
+# The logo source files are kept out of the repository; see the README.
+cerebro logo/
