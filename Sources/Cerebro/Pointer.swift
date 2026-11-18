@@ -20,6 +20,15 @@ final class Pointer {
     private let tick: TimeInterval = 1.0 / 120
     // Fraction of the queued movement applied per tick (~35 ms time constant).
     private let easing = 0.21
+    // How far the head has tried to move the cursor since `takeTravel()` was last called.
+    private var travelled = CGVector.zero
+
+    /// How far the head has tried to move the cursor since the previous call. This keeps counting
+    /// against a screen edge, where the cursor itself stops.
+    func takeTravel() -> CGVector {
+        defer { travelled = .zero }
+        return travelled
+    }
 
     func move(dYaw: Double, dPitch: Double, dt: TimeInterval) {
         let speed = hypot(dYaw, dPitch) / dt
@@ -43,18 +52,26 @@ final class Pointer {
         timer = nil
     }
 
-    func click(_ button: CGMouseButton) {
-        guard let position = CGEvent(source: nil)?.location else { return }
+    /// Clicks where the cursor is, or at `position` if given. `count` is 2 for a double click.
+    func click(_ button: CGMouseButton, at position: CGPoint? = nil, count: Int = 1) {
+        guard let position = position ?? CGEvent(source: nil)?.location else { return }
         let types: [CGEventType] = button == .right ? [.rightMouseDown, .rightMouseUp] : [.leftMouseDown, .leftMouseUp]
-        for type in types {
-            let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: position, mouseButton: button)
-            event?.setIntegerValueField(.mouseEventClickState, value: 1)
-            event?.post(tap: .cghidEventTap)
+        for press in 1...max(count, 1) {
+            for type in types {
+                let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: position, mouseButton: button)
+                event?.setIntegerValueField(.mouseEventClickState, value: Int64(press))
+                event?.post(tap: .cghidEventTap)
+            }
         }
     }
 
+    /// Where the cursor is, in the coordinates `click(_:at:count:)` takes.
+    var position: CGPoint? { CGEvent(source: nil)?.location }
+
     private func flush() {
         let dx = take(&pending.dx), dy = take(&pending.dy)
+        travelled.dx += dx
+        travelled.dy += dy
         // Moving relative to wherever the cursor is now lets a trackpad or mouse keep working alongside.
         if dx != 0 || dy != 0, let current = CGEvent(source: nil)?.location {
             let target = clamp(CGPoint(x: current.x + dx, y: current.y + dy))

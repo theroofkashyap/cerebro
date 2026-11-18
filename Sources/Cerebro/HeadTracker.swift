@@ -12,6 +12,8 @@ final class HeadTracker: NSObject, CMHeadphoneMotionManagerDelegate {
 
     /// Called on the main queue with the rotation (radians) since the previous sample.
     var onDelta: ((_ dYaw: Double, _ dPitch: Double, _ dt: TimeInterval) -> Void)?
+    /// Called on the main queue with every reading, including the acceleration and rotation rate.
+    var onSample: ((MotionSample) -> Void)?
     var onStateChange: ((State) -> Void)?
 
     private(set) var state = State.waiting {
@@ -75,6 +77,13 @@ final class HeadTracker: NSObject, CMHeadphoneMotionManagerDelegate {
         let yaw = motion.attitude.yaw, pitch = motion.attitude.pitch, time = motion.timestamp
         defer { last = (yaw, pitch, time) }
         measureRate(at: time)
+        if let onSample {
+            let rate = motion.rotationRate, acceleration = motion.userAcceleration, gravity = motion.gravity
+            onSample(MotionSample(time: time, yaw: yaw, pitch: pitch, roll: motion.attitude.roll,
+                                  rotation: (rate.x, rate.y, rate.z),
+                                  acceleration: (acceleration.x, acceleration.y, acceleration.z),
+                                  gravity: (gravity.x, gravity.y, gravity.z)))
+        }
 
         guard let last, time > last.time, time - last.time < maxGap else { return }
         // Yaw wraps at ±π; take the short way round.

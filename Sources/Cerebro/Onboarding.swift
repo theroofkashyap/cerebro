@@ -34,7 +34,7 @@ final class Onboarding {
 }
 
 // Borderless windows refuse key status by default, which would leave the buttons dead.
-private final class KeyableWindow: NSWindow {
+final class KeyableWindow: NSWindow {
     override var canBecomeKey: Bool { true }
 }
 

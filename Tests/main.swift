@@ -263,5 +263,223 @@ check(runReal { feed in
     move((real.left * 0.7 + real.up * 0.7) * -1, over: 0.3, feed: feed); hold(6, feed: feed)
 } == ["armed", "cancelled"], "real: a diagonal look after activating fires nothing")
 
+// MARK: Dwell click, with the cursor updated at 60 Hz
+
+struct DwellRun {
+    let clicker = DwellClicker()
+    var cursor = CGPoint(x: 500, y: 500)
+    var clicks = 0
+    var sawProgress = false
+    private let step = 1.0 / 60
+
+    /// The head carries the cursor by (dx, dy) over `seconds`.
+    mutating func head(_ dx: Double, _ dy: Double, over seconds: Double) { advance(seconds, head: (dx, dy), cursor: (dx, dy)) }
+    /// The trackpad carries the cursor.
+    mutating func hand(_ dx: Double, _ dy: Double, over seconds: Double) { advance(seconds, head: (0, 0), cursor: (dx, dy)) }
+    /// The head pushes against a screen edge, so the cursor stays where it is.
+    mutating func push(_ dx: Double, _ dy: Double, over seconds: Double) { advance(seconds, head: (dx, dy), cursor: (0, 0)) }
+    mutating func rest(_ seconds: Double) { advance(seconds, head: (0, 0), cursor: (0, 0)) }
+
+    private mutating func advance(_ seconds: Double, head: (Double, Double), cursor by: (Double, Double)) {
+        let steps = max(Int((seconds / step).rounded()), 1)
+        for _ in 0..<steps {
+            cursor.x += by.0 / Double(steps)
+            cursor.y += by.1 / Double(steps)
+            let travel = CGVector(dx: head.0 / Double(steps), dy: head.1 / Double(steps))
+            switch clicker.update(position: cursor, headTravel: travel, dt: step) {
+            case .click: clicks += 1
+            case .progress: sawProgress = true
+            case .idle: break
+            }
+        }
+    }
+}
+
+var dwell = DwellRun()
+dwell.rest(3)
+check(dwell.clicks == 0, "dwell: a cursor the head never moved does not click")
+dwell.head(200, 50, over: 0.5); dwell.rest(0.9)
+check(dwell.clicks == 0 && dwell.sawProgress, "dwell: progress shows before the click")
+dwell.rest(0.3)
+check(dwell.clicks == 1, "dwell: the head moves the cursor, rests a second, and it clicks once")
+dwell.rest(5)
+check(dwell.clicks == 1, "dwell: staying put after a click does not click again")
+dwell.head(20, 0, over: 0.2); dwell.rest(2)
+check(dwell.clicks == 1, "dwell: a small shift after a click is not enough for another")
+dwell.head(100, 0, over: 0.4); dwell.rest(1.2)
+check(dwell.clicks == 2, "dwell: carrying the cursor away and resting clicks again")
+dwell.head(150, 0, over: 0.4); dwell.head(-150, 0, over: 0.4); dwell.rest(1.2)
+check(dwell.clicks == 3, "dwell: coming back to the same spot can click it a second time")
+
+dwell = DwellRun()
+dwell.head(200, 0, over: 0.5); dwell.rest(0.6); dwell.head(-150, 0, over: 0.4); dwell.rest(0.6); dwell.head(80, 0, over: 0.3)
+check(dwell.clicks == 0, "dwell: short pauses on the way somewhere do not click")
+
+dwell = DwellRun()
+dwell.hand(300, 0, over: 0.5); dwell.rest(3)
+check(dwell.clicks == 0, "dwell: a cursor parked by the trackpad does not click")
+
+dwell = DwellRun()
+dwell.head(200, 0, over: 0.5); dwell.rest(0.4); dwell.hand(60, 0, over: 0.3); dwell.rest(3)
+check(dwell.clicks == 0, "dwell: taking over with the trackpad cancels the click")
+
+dwell = DwellRun()
+dwell.head(200, 0, over: 0.5); dwell.push(300, 0, over: 3)
+check(dwell.clicks == 0, "dwell: pushing into a screen edge does not click")
+dwell.rest(1.2)
+check(dwell.clicks == 1, "dwell: resting at the edge afterwards does")
+
+dwell = DwellRun()
+dwell.head(200, 0, over: 0.5)
+for _ in 0..<40 { dwell.head(1, -0.5, over: 0.017); dwell.head(-1, 0.5, over: 0.017) }
+check(dwell.clicks == 1, "dwell: a slight tremor while resting still clicks")
+
+dwell = DwellRun()
+dwell.head(200, 0, over: 0.5); dwell.head(60, 0, over: 3)
+check(dwell.clicks == 0, "dwell: a slow glide across the screen does not click")
+
+// MARK: Signal check script, with motion arriving at 50 Hz
+
+let recorder = SignalRecorder()
+recorder.directory = URL(fileURLWithPath: NSTemporaryDirectory())
+    .appendingPathComponent("cerebro-test-\(ProcessInfo.processInfo.processIdentifier)", isDirectory: true)
+recorder.start()
+for _ in 0..<100 { recorder.tick(dt: 0.05) }
+check(recorder.phase == .intro && recorder.stalled, "signal check: the script waits while no motion arrives")
+
+var clock = 0.0
+var cuesSeen: [String: Set<Int>] = [:]
+while recorder.isRunning, clock < 600 {
+    clock += 0.02
+    recorder.add(MotionSample(time: clock, yaw: 0, pitch: 0, roll: 0, rotation: (0, 0, 0),
+                              acceleration: (0, 0, 0), gravity: (0, 0, -1)))
+    recorder.tick(dt: 0.02)
+    if recorder.phase == .cue, let action = recorder.action { cuesSeen[action.id, default: []].insert(recorder.rep) }
+}
+check(recorder.phase == .done && !recorder.stalled, "signal check: the script runs to the end once motion arrives")
+check(SignalRecorder.actions.allSatisfy { cuesSeen[$0.id]?.count == $0.repeats },
+      "signal check: every movement is cued the right number of times")
+let logLines = (recorder.savedTo.flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? "").split(separator: "\n")
+check(logLines.first?.hasPrefix("t,script_t,phase,action,rep,yaw") == true, "signal check: the log starts with its header")
+// One second of the script ran before the motion stopped arriving above.
+check(abs(Double(logLines.count - 1) - (recorder.totalTime - 1) / 0.02) <= 10,
+      "signal check: every sample is logged: \(logLines.count - 1) rows for \(Int(recorder.totalTime)) s")
+check(logLines.contains { $0.contains(",cue,clench,3,") } && logLines.contains { $0.contains(",still,,0,") },
+      "signal check: each row carries the step it was recorded in")
+check(recorder.summary.contains("at 50 per second"), "signal check: the summary reports the sample rate: \(recorder.summary)")
+
+// Outside the script, what arrives is kept as a free log, but only if there is enough of it.
+for index in 0..<100 { recorder.add(MotionSample(time: 1000 + Double(index) * 0.02, yaw: 0, pitch: 0, roll: 0, rotation: (0, 0, 0),
+                                                 acceleration: (0, 0, 0), gravity: (0, 0, -1))) }
+check(recorder.saveFreeLog() == nil, "signal check: two seconds tried by hand are not worth a file")
+for index in 0..<300 { recorder.add(MotionSample(time: 2000 + Double(index) * 0.02, yaw: 0, pitch: 0, roll: 0, rotation: (0, 0, 0),
+                                                 acceleration: (0, 0, 0), gravity: (0, 0, -1))) }
+let freeLog = recorder.saveFreeLog()
+let freeLines = (freeLog.flatMap { try? String(contentsOf: $0, encoding: .utf8) } ?? "").split(separator: "\n")
+check(freeLog?.lastPathComponent.hasPrefix("live-") == true && freeLines.count == 301 && freeLines.last?.contains(",free,,0,") == true,
+      "signal check: six seconds tried by hand are saved as a free log: \(freeLines.count) lines")
+if let file = recorder.savedTo { try? FileManager.default.removeItem(at: file.deletingLastPathComponent()) }
+
+// MARK: Bite detector, against a simulated earbud at 50 Hz
+
+/// An earbud with sensor noise and, optionally, the steady head bob seen in a real recording.
+final class EarbudSim {
+    let detector = BiteDetector()
+    var bites: [BiteDetector.Bite] = []
+    /// How long after each bite's first jolt it was reported.
+    var delays: [Double] = []
+    var bobbing = false
+    private var time = 0.0
+    private var seed: UInt64 = 42
+
+    init() {
+        detector.onBite = { [unowned self] bite, at in
+            self.bites.append(bite)
+            self.delays.append(self.time - at)
+        }
+    }
+
+    /// Runs for `seconds`. `turn` is the head's rotation rate (rad/s) and `jolts` lists the sharp
+    /// knocks to the earbud as (time since the start of this run, size in g).
+    func run(_ seconds: Double, turn: (Double) -> Double = { _ in 0 }, jolts: [(at: Double, size: Double)] = []) {
+        for step in 0..<Int((seconds / 0.02).rounded()) {
+            let t = Double(step) * 0.02
+            time += 0.02
+            // A one-sample spike of half the size bends the acceleration by the full size.
+            let knock = jolts.filter { abs($0.at - t) < 0.005 }.reduce(0) { $0 + $1.size / 2 }
+            let bob = bobbing ? sin(2 * .pi * 2.6 * time) : 0
+            detector.feed(MotionSample(
+                time: time, yaw: 0, pitch: 0, roll: 0,
+                rotation: (gaussian() * 0.004 + 0.2 * bob, gaussian() * 0.004, gaussian() * 0.004 + turn(t)),
+                acceleration: (gaussian() * 0.0008, gaussian() * 0.0008 + 0.02 * bob + knock, gaussian() * 0.0008),
+                gravity: (0, 0, -1)))
+        }
+    }
+
+    private func uniform() -> Double {
+        seed = seed &* 6364136223846793005 &+ 1442695040888963407
+        return (Double(seed >> 11) + 0.5) / Double(1 << 53)
+    }
+
+    private func gaussian() -> Double {
+        (-2 * log(uniform())).squareRoot() * cos(2 * .pi * uniform())
+    }
+}
+
+var earbud = EarbudSim()
+earbud.bobbing = true
+earbud.run(60)
+check(earbud.bites.isEmpty, "bite: a minute of nodding along to music is not a bite: \(earbud.bites)")
+
+earbud.run(2, jolts: [(0.5, 0.1)])
+check(earbud.bites == [.single] && earbud.delays[0] > 0.5, "bite: one bite reads as single, after waiting for a second one: \(earbud.bites) \(earbud.delays)")
+
+earbud.bites = []
+earbud.run(2, jolts: [(0.5, 0.1), (0.86, 0.08)])
+check(earbud.bites == [.double], "bite: two bites a third of a second apart read as double: \(earbud.bites)")
+
+earbud.bites = []
+earbud.run(3, jolts: [(0.5, 0.1), (1.7, 0.1)])
+check(earbud.bites == [.single, .single], "bite: two bites over a second apart read as two singles: \(earbud.bites)")
+
+earbud.bites = []
+earbud.run(2, jolts: [(0.5, 0.12), (0.62, 0.045)])
+check(earbud.bites == [.single], "bite: the ringing after a bite is not a second bite: \(earbud.bites)")
+
+earbud.bites = []
+earbud.run(2, jolts: [(0.5, 0.03), (0.9, 0.035), (1.2, 0.04)])
+check(earbud.bites.isEmpty, "bite: jolts the size of speech are ignored: \(earbud.bites)")
+
+earbud.bites = []
+earbud.run(3, jolts: [(0.5, 0.055), (0.6, 0.05), (0.7, 0.055), (0.8, 0.05), (0.9, 0.06), (1.0, 0.05)])
+check(earbud.bites.isEmpty, "bite: a run of jolts, as in swallowing or chewing, is ignored: \(earbud.bites)")
+
+earbud.bites = []
+earbud.run(3, jolts: [(0.5, 0.1), (0.86, 0.1), (1.06, 0.1)])
+check(earbud.bites.isEmpty, "bite: a third jolt straight after two cancels the double: \(earbud.bites)")
+
+earbud.bites = []
+earbud.run(2, jolts: [(0.5, 0.04), (0.7, 0.1)])
+check(earbud.bites.isEmpty, "bite: a jolt that follows another one closely is not a bite: \(earbud.bites)")
+
+earbud.bites = []
+earbud.run(3, turn: { $0 >= 0.3 && $0 < 1.5 ? 0.8 : 0 }, jolts: [(1.0, 0.1)])
+check(earbud.bites.isEmpty, "bite: a jolt while the head is turning is ignored: \(earbud.bites)")
+earbud.run(2, jolts: [(0.5, 0.1)])
+check(earbud.bites == [.single], "bite: and one after the head has stopped counts again: \(earbud.bites)")
+
+earbud = EarbudSim()
+earbud.detector.listensForDouble = false
+earbud.run(2, jolts: [(0.5, 0.1)])
+check(earbud.bites == [.single] && earbud.delays[0] < 0.05, "bite: with nothing on the double bite, a single is reported at once: \(earbud.delays)")
+
+earbud = EarbudSim()
+earbud.detector.threshold = 0.06
+earbud.run(2, jolts: [(0.5, 0.05)])
+check(earbud.bites.isEmpty, "bite: lower sensitivity ignores a gentle bite")
+earbud.detector.threshold = 0.035
+earbud.run(2, jolts: [(0.5, 0.05)])
+check(earbud.bites == [.single], "bite: higher sensitivity catches it: \(earbud.bites)")
+
 print(failures == 0 ? "ALL PASSED" : "\(failures) FAILED")
 exit(failures == 0 ? 0 : 1)

@@ -5,13 +5,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private static let sensitivities: [(name: String, pointsPerRadian: Double)] = [
         ("Low", 2400), ("Medium", 3600), ("High", 5400),
     ]
+    private static let dwellTimes: [(name: String, seconds: Double)] = [
+        ("Short", 0.7), ("Medium", 1.0), ("Long", 1.5),
+    ]
+    // The smallest jolt, in g, that counts as a bite.
+    private static let biteSensitivities: [(name: String, threshold: Double)] = [
+        ("Low", 0.060), ("Medium", 0.045), ("High", 0.035),
+    ]
 
     private let tracker = HeadTracker()
     private let pointer = Pointer()
+    private lazy var dwell = DwellController(pointer: pointer)
+    private lazy var bite = BiteClick(pointer: pointer)
     private let buttons = RemoteButtons()
     private let gestures = GestureEngine()
     private let overlay = Overlay()
     private let onboarding = Onboarding()
+    private let signalCheck = SignalCheck()
     private var hotKey: HotKey?
     private let testSignal = DispatchSource.makeSignalSource(signal: SIGUSR1, queue: .main)
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -20,15 +30,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var paused = false
     private var shortcutsEnabled = true
     private var headCursorEnabled = false
+    private var dwellEnabled = false
+    private var biteEnabled = false
     private var accessibilityGranted = false
 
+    /// True while something else is using head movement, so nothing should click by itself.
+    private var clicksBlocked: Bool {
+        paused || gestures.isArmed || onboarding.isActive || signalCheck.isActive
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
-        defaults.register(defaults: ["sensitivity": pointer.sensitivity, "shortcutsEnabled": true])
+        defaults.register(defaults: ["sensitivity": pointer.sensitivity, "shortcutsEnabled": true, "dwellTime": dwell.dwellTime,
+                                     "biteThreshold": bite.threshold, "bite.single": bite.single.rawValue,
+                                     "bite.double": bite.double.rawValue])
         pointer.sensitivity = defaults.double(forKey: "sensitivity")
         pointer.invertX = defaults.bool(forKey: "invertX")
         pointer.invertY = defaults.bool(forKey: "invertY")
         shortcutsEnabled = defaults.bool(forKey: "shortcutsEnabled")
         headCursorEnabled = defaults.bool(forKey: "headCursorEnabled")
+        dwellEnabled = defaults.bool(forKey: "dwellEnabled")
+        dwell.dwellTime = defaults.double(forKey: "dwellTime")
+        // A cursor that is resting because the head is busy with something else must not click.
+        dwell.isBlocked = { [weak self] in self?.clicksBlocked ?? true }
+        dwell.setActive(headCursorEnabled && dwellEnabled)
+
+        biteEnabled = defaults.bool(forKey: "biteEnabled")
+        bite.threshold = defaults.double(forKey: "biteThreshold")
+        bite.single = BiteClick.Action(rawValue: defaults.string(forKey: "bite.single") ?? "") ?? .click
+        bite.double = BiteClick.Action(rawValue: defaults.string(forKey: "bite.double") ?? "") ?? .rightClick
+        bite.isBlocked = { [weak self] in self?.clicksBlocked ?? true }
+        bite.onClick = { [weak self] in self?.dwell.clicked() }
 
         let menu = NSMenu()
         menu.delegate = self
@@ -45,6 +76,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         tracker.onStateChange = { [weak self] in self?.trackerChanged(to: $0) }
         tracker.onDelta = { [weak self] dYaw, dPitch, dt in self?.headMoved(dYaw: dYaw, dPitch: dPitch, dt: dt) }
+        tracker.onSample = { [weak self] sample in
+            guard let self else { return }
+            self.signalCheck.add(sample)
+            if self.headCursorEnabled, self.biteEnabled { self.bite.feed(sample) }
+        }
         tracker.start()
         NSLog("Head tracking: %@", tracker.state.rawValue)
 
@@ -73,7 +109,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Head input
 
     private func headMoved(dYaw: Double, dPitch: Double, dt: TimeInterval) {
-        guard !paused else { return }
+        // A signal check asks for small movements with the head still, so nothing should react to them.
+        guard !paused, !signalCheck.isActive else { return }
         let delta = HeadVector(yaw: dYaw * 180 / .pi, pitch: dPitch * 180 / .pi)
         // Once calibration has finished, shortcuts are live even with its window still open,
         // so the finish screen is a place to try them.
@@ -169,6 +206,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let cursor = NSMenu()
         cursor.addItem(withTitle: "Move Cursor With Head", action: #selector(toggleHeadCursor), keyEquivalent: "")
             .state = headCursorEnabled ? .on : .off
+        cursor.addItem(withTitle: "Dwell Click", action: #selector(toggleDwell), keyEquivalent: "")
+            .state = dwellEnabled ? .on : .off
+        let dwellTime = NSMenu()
+        for option in Self.dwellTimes {
+            let item = dwellTime.addItem(withTitle: "\(option.name) (\(option.seconds) s)", action: #selector(setDwellTime(_:)), keyEquivalent: "")
+            item.representedObject = option.seconds
+            item.state = option.seconds == dwell.dwellTime ? .on : .off
+        }
+        cursor.addItem(withTitle: "Dwell Time", action: nil, keyEquivalent: "").submenu = dwellTime
+        cursor.addItem(.separator())
+
+        cursor.addItem(withTitle: "Bite Click", action: #selector(toggleBite), keyEquivalent: "")
+            .state = biteEnabled ? .on : .off
+        for (title, key, current) in [("Bite", "bite.single", bite.single), ("Double Bite", "bite.double", bite.double)] {
+            let choices = NSMenu()
+            for option in BiteClick.Action.allCases {
+                let item = choices.addItem(withTitle: option.title, action: #selector(setBiteAction(_:)), keyEquivalent: "")
+                item.representedObject = [key, option.rawValue]
+                item.state = option == current ? .on : .off
+            }
+            cursor.addItem(withTitle: "\(title): \(current.title)", action: nil, keyEquivalent: "").submenu = choices
+        }
+        let biteSensitivity = NSMenu()
+        for option in Self.biteSensitivities {
+            let item = biteSensitivity.addItem(withTitle: option.name, action: #selector(setBiteSensitivity(_:)), keyEquivalent: "")
+            item.representedObject = option.threshold
+            item.state = option.threshold == bite.threshold ? .on : .off
+        }
+        cursor.addItem(withTitle: "Bite Sensitivity", action: nil, keyEquivalent: "").submenu = biteSensitivity
         cursor.addItem(.separator())
         let sensitivity = NSMenu()
         for option in Self.sensitivities {
@@ -182,6 +248,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         cursor.addItem(withTitle: "Invert Vertical", action: #selector(toggleInvertY), keyEquivalent: "")
             .state = pointer.invertY ? .on : .off
         cursor.addItem(withTitle: "Reclaim Headphone Buttons", action: #selector(reclaimButtons), keyEquivalent: "")
+        cursor.addItem(.separator())
+        cursor.addItem(withTitle: "Signal Check…", action: #selector(showSignalCheck), keyEquivalent: "")
         menu.addItem(withTitle: "Head Cursor", action: nil, keyEquivalent: "").submenu = cursor
         menu.addItem(.separator())
 
@@ -235,7 +303,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         headCursorEnabled.toggle()
         defaults.set(headCursorEnabled, forKey: "headCursorEnabled")
         buttons.setActive(headCursorEnabled)
+        dwell.setActive(headCursorEnabled && dwellEnabled)
         if !headCursorEnabled { pointer.stop() }
+    }
+
+    @objc private func toggleDwell() {
+        dwellEnabled.toggle()
+        defaults.set(dwellEnabled, forKey: "dwellEnabled")
+        dwell.setActive(headCursorEnabled && dwellEnabled)
+    }
+
+    @objc private func setDwellTime(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? Double else { return }
+        dwell.dwellTime = value
+        defaults.set(value, forKey: "dwellTime")
+    }
+
+    @objc private func toggleBite() {
+        biteEnabled.toggle()
+        defaults.set(biteEnabled, forKey: "biteEnabled")
+        bite.reset()
+    }
+
+    @objc private func setBiteAction(_ sender: NSMenuItem) {
+        guard let choice = sender.representedObject as? [String], choice.count == 2,
+              let action = BiteClick.Action(rawValue: choice[1]) else { return }
+        if choice[0] == "bite.single" { bite.single = action } else { bite.double = action }
+        defaults.set(action.rawValue, forKey: choice[0])
+    }
+
+    @objc private func setBiteSensitivity(_ sender: NSMenuItem) {
+        guard let value = sender.representedObject as? Double else { return }
+        bite.threshold = value
+        defaults.set(value, forKey: "biteThreshold")
+    }
+
+    @objc private func showSignalCheck() {
+        pointer.stop()
+        gestures.reset()
+        signalCheck.show(biteThreshold: bite.threshold)
     }
 
     @objc private func reclaimButtons() {
